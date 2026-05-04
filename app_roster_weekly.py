@@ -107,6 +107,28 @@ from roster_engine_v12_5_tunable import (
 
 # v12.7 Overnight Shift engine removed
 
+# AART UI + Continuity helpers (2026 redesign)
+from ui_components import (
+    apply_global_styles,
+    render_app_header,
+    render_kpi_grid,
+    render_kpi_card,
+    render_day_strip,
+    render_status_badge,
+    render_section_header,
+    render_empty_state,
+)
+from week_continuity import (
+    parse_previous_week_roster,
+    build_continuity_constraints,
+    build_continuity_report_df,
+    build_store_detail_df,
+    build_week_continuity_sheet,
+    STRATEGY_FULL,
+    STRATEGY_COVERAGE,
+    STRATEGY_FLEX,
+)
+
 
 st.set_page_config(
     page_title="AART - AI Assisted Rostering Tool",
@@ -3072,8 +3094,17 @@ def create_coverage_heatmap(roster_df, slot_priorities):
     fig.update_layout(
         height=700,
         title_text="Coverage Analysis Dashboard",
-        showlegend=False
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#64748B'),
     )
+    
+    # Make subplot axes transparent too
+    for i in range(1, 3):
+        for j in range(1, 3):
+            fig.update_xaxes(gridcolor='rgba(148,163,184,0.15)', row=i, col=j)
+            fig.update_yaxes(gridcolor='rgba(148,163,184,0.15)', row=i, col=j)
     
     return fig
 
@@ -3272,10 +3303,14 @@ def generate_dsp_slot_matrix(shifts_df, demand_df, store, params):
 def create_hourly_comparison_chart(roster_df, slot_priorities, selected_day='All Week', flex_roster_df=None):
     """Create bar chart comparing required vs rostered by hour, with orders line.
     
+    Required is shown as a standalone grouped bar on the left of each hour.
+    Rostered and Flex DAs (Part-Time) are stacked together on the right.
+    
     Args:
         roster_df: DataFrame with roster data
         slot_priorities: Dict of slot priorities
         selected_day: 'All Week' or specific day name (Sun, Mon, etc.)
+        flex_roster_df: Optional DataFrame with flex DA roster data
     """
     if roster_df is None or roster_df.empty:
         return None
@@ -3308,22 +3343,52 @@ def create_hourly_comparison_chart(roster_df, slot_priorities, selected_day='All
     hourly = filtered_df.groupby('Slot').agg(agg_dict).reset_index()
     
     fig = go.Figure()
-    
-    # Required bars
+
+    _has_flex = flex_roster_df is not None and not flex_roster_df.empty
+
+    # --- Required bars: standalone group on the LEFT of each hour ---
     fig.add_trace(go.Bar(
         x=hourly['Slot'],
         y=hourly['Required'],
         name='Required',
-        marker_color='rgba(255, 127, 14, 0.7)'
+        marker_color='rgba(255, 127, 14, 0.7)',
+        offsetgroup='required',
     ))
-    
-    # Rostered bars
+
+    # --- Rostered bars: base of the stacked group on the RIGHT ---
     fig.add_trace(go.Bar(
         x=hourly['Slot'],
         y=hourly['Rostered'],
         name='Rostered',
-        marker_color='rgba(31, 119, 180, 0.7)'
+        marker_color='rgba(31, 119, 180, 0.7)',
+        offsetgroup='rostered',
     ))
+
+    # --- Flex DA coverage stacked on top of Rostered ---
+    if _has_flex:
+        if selected_day != 'All Week':
+            day_map_flex = {
+                'Sunday': 'Sun', 'Monday': 'Mon', 'Tuesday': 'Tue',
+                'Wednesday': 'Wed', 'Thursday': 'Thu', 'Friday': 'Fri',
+                'Saturday': 'Sat',
+            }
+            short_day_flex = day_map_flex.get(selected_day, selected_day[:3])
+            filtered_flex = flex_roster_df[flex_roster_df['Day'].str[:3] == short_day_flex]
+        else:
+            filtered_flex = flex_roster_df
+
+        flex_hourly = filtered_flex.groupby('Slot')['Flex_Rostered'].sum().reset_index()
+        # Merge so we have matching slots
+        merged = hourly[['Slot', 'Rostered']].merge(flex_hourly, on='Slot', how='left').fillna(0)
+
+        fig.add_trace(go.Bar(
+            x=merged['Slot'],
+            y=merged['Flex_Rostered'],
+            name='Flex DAs (Part-Time)',
+            marker_color='rgba(148, 103, 189, 0.7)',
+            offsetgroup='rostered',
+            base=merged['Rostered'],
+        ))
     
     # Orders line (on secondary y-axis)
     if 'Orders' in hourly.columns:
@@ -3347,28 +3412,6 @@ def create_hourly_comparison_chart(roster_df, slot_priorities, selected_day='All
                     text="⭐", showarrow=False, font=dict(size=12)
                 )
 
-    # Flex DA coverage stacked on top of Rostered (only when flex data supplied)
-    _has_flex = flex_roster_df is not None and not flex_roster_df.empty
-    if _has_flex:
-        if selected_day != 'All Week':
-            day_map = {
-                'Sunday': 'Sun', 'Monday': 'Mon', 'Tuesday': 'Tue',
-                'Wednesday': 'Wed', 'Thursday': 'Thu', 'Friday': 'Fri',
-                'Saturday': 'Sat',
-            }
-            short_day = day_map.get(selected_day, selected_day[:3])
-            filtered_flex = flex_roster_df[flex_roster_df['Day'].str[:3] == short_day]
-        else:
-            filtered_flex = flex_roster_df
-
-        flex_hourly = filtered_flex.groupby('Slot')['Flex_Rostered'].sum().reset_index()
-        fig.add_trace(go.Bar(
-            x=flex_hourly['Slot'],
-            y=flex_hourly['Flex_Rostered'],
-            name='Flex DAs (Part-Time)',
-            marker_color='rgba(148, 103, 189, 0.7)',
-        ))
-
     title_label = (
         "Hourly Coverage: Required vs Rostered (+ Flex)"
         if _has_flex else "Hourly Coverage: Required vs Rostered"
@@ -3383,7 +3426,7 @@ def create_hourly_comparison_chart(roster_df, slot_priorities, selected_day='All
             side='right',
             showgrid=False
         ),
-        barmode='stack' if _has_flex else 'group',
+        barmode='group',
         height=400,
         legend=dict(
             orientation="h",
@@ -3391,7 +3434,12 @@ def create_hourly_comparison_chart(roster_df, slot_priorities, selected_day='All
             y=1.02,
             xanchor="right",
             x=1
-        )
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#64748B'),
+        xaxis=dict(gridcolor='rgba(148,163,184,0.15)'),
+        yaxis=dict(gridcolor='rgba(148,163,184,0.15)'),
     )
 
     return fig
@@ -4951,23 +4999,187 @@ def create_network_summary_chart(results_df):
     fig.add_trace(go.Bar(x=results_df['Store'], y=-results_df['Excess_DAs'], name='Excess DAs', marker_color='green'), row=2, col=1)
     fig.add_trace(go.Bar(x=results_df['Store'], y=results_df['Coverage_%'], name='Coverage %', marker_color='purple'), row=2, col=2)
     
-    fig.update_layout(height=600, showlegend=False)
+    fig.update_layout(height=600, showlegend=False,
+                      paper_bgcolor='rgba(0,0,0,0)',
+                      plot_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#64748B'))
     return fig
 
+# =============================================================================
+# WEEK CONTINUITY — SIDEBAR UI HELPER
+# =============================================================================
+
+def _render_week_continuity_sidebar(selected_week):
+    """Render the "🔗 Week Continuity" accordion in the sidebar.
+
+    This section lets the planner upload the *previous* week's roster
+    (the exact Excel file this app produces) and apply one of three
+    continuity strategies:
+
+      * Full Continuity — connect same DA IDs across weeks
+      * Coverage Only   — anonymous Sunday coverage boost
+      * Flexible Handoff — matching algorithm for changed DSP rosters
+
+    The parsed data and constraints are persisted to session state under:
+
+      * ``prev_week_data``      — parser output dict
+      * ``continuity_strategy`` — strategy string
+      * ``week_continuity``     — constraints dict (includes report data)
+      * ``carryover_excel_data``— bridged for existing engine params flow
+    """
+    import re
+    from week_continuity import (
+        parse_previous_week_roster,
+        build_continuity_constraints,
+        build_continuity_report_df,
+        build_store_detail_df,
+        STRATEGY_FULL,
+        STRATEGY_COVERAGE,
+        STRATEGY_FLEX,
+    )
+
+    # Suggest the previous week number (e.g. WK17 -> WK16)
+    prev_week_suggest = None
+    if selected_week:
+        m = re.search(r"WK(\d+)", str(selected_week), re.IGNORECASE)
+        if m:
+            prev_week_suggest = f"WK{max(1, int(m.group(1)) - 1)}"
+
+    with st.expander("🔗 Week Continuity", expanded=False):
+        st.markdown(
+            "**Carry forward Saturday overnight DAs** from last week's roster "
+            "so Sunday rest rules are respected automatically."
+        )
+
+        if prev_week_suggest:
+            st.caption(f"💡 Suggested file: last week's export for **{prev_week_suggest}**")
+
+        prev_file = st.file_uploader(
+            "Upload previous week's roster (.xlsx)",
+            type=["xlsx"],
+            key="continuity_prev_roster",
+            help="The Excel file this app exported for the previous week.",
+        )
+
+        # Strategy selector (radio rendered as toggle cards by Streamlit theming)
+        strategy_label = {
+            STRATEGY_FULL: "⭐ Strategy A — Full Continuity (recommended)",
+            STRATEGY_COVERAGE: "Strategy B — Coverage Only",
+            STRATEGY_FLEX: "Strategy C — Flexible Handoff",
+        }
+        strategy = st.radio(
+            "Continuity strategy",
+            options=[STRATEGY_FULL, STRATEGY_COVERAGE, STRATEGY_FLEX],
+            format_func=lambda s: strategy_label[s],
+            index=[STRATEGY_FULL, STRATEGY_COVERAGE, STRATEGY_FLEX].index(
+                st.session_state.get("continuity_strategy", STRATEGY_FULL)
+            ),
+            key="continuity_strategy_radio",
+            help=(
+                "A: reuses same DA IDs across weeks (audit-friendly). "
+                "B: anonymous Sunday coverage boost (fastest). "
+                "C: match last week's overnight DAs to this week's latest Sunday starts."
+            ),
+        )
+        st.session_state["continuity_strategy"] = strategy
+
+        st.info(
+            "💡 **Best practice** — Strategy A is recommended for operations "
+            "with ≥10% overnight shifts. Strategy B is fastest when DA-level "
+            "tracking is not required. Strategy C suits weeks where DSP "
+            "rosters change significantly."
+        )
+
+        # Parse & persist on upload
+        if prev_file is not None:
+            # Cache key based on filename/size to avoid reparsing every rerun
+            key_sig = f"{getattr(prev_file, 'name', '')}:{getattr(prev_file, 'size', '')}"
+            if st.session_state.get("prev_week_file_sig") != key_sig:
+                try:
+                    parsed = parse_previous_week_roster(
+                        prev_file,
+                        min_rest=int(st.session_state.get("min_rest", 12)),
+                        shift_hours=int(st.session_state.get("shift_hours", 10)),
+                    )
+                    st.session_state["prev_week_data"] = parsed
+                    st.session_state["prev_week_file_sig"] = key_sig
+                except Exception as e:
+                    st.error(f"❌ Invalid roster format: {e}")
+                    st.session_state.pop("prev_week_data", None)
+                    st.session_state.pop("prev_week_file_sig", None)
+
+        prev_data = st.session_state.get("prev_week_data")
+        if prev_data and prev_data.get("total_overnight_das", 0) > 0:
+            wk_det = prev_data.get("week_detected") or "previous week"
+            st.success(
+                f"✅ Detected **{prev_data['total_overnight_das']}** Saturday "
+                f"overnight DAs across **{prev_data['total_stores']}** stores "
+                f"({wk_det})."
+            )
+
+            # Build constraints now so they flow into the engine via params
+            constraints = build_continuity_constraints(
+                prev_data,
+                {
+                    "min_rest": int(st.session_state.get("min_rest", 12)),
+                    "shift_hours": int(st.session_state.get("shift_hours", 10)),
+                },
+                strategy,
+            )
+            st.session_state["week_continuity"] = constraints
+            # Bridge into existing engine param key — engines already read this.
+            st.session_state["carryover_excel_data"] = pd.DataFrame(
+                constraints["carryover_excel_data"]
+            ) if constraints["carryover_excel_data"] else pd.DataFrame()
+
+            # Preview (per-store summary)
+            report_df = build_continuity_report_df(prev_data, constraints)
+            if not report_df.empty:
+                st.dataframe(
+                    report_df, use_container_width=True, hide_index=True
+                )
+                # Per-store expandable details
+                stores_list = list(prev_data.get("stores", {}).keys())
+                if stores_list:
+                    pick = st.selectbox(
+                        "🔎 Inspect store",
+                        options=["—"] + stores_list,
+                        key="continuity_detail_pick",
+                    )
+                    if pick and pick != "—":
+                        detail_df = build_store_detail_df(prev_data, pick)
+                        if not detail_df.empty:
+                            st.dataframe(
+                                detail_df, use_container_width=True, hide_index=True
+                            )
+        elif prev_data is not None:
+            st.info("No Saturday overnight shifts were found in the uploaded file.")
+        else:
+            st.caption("📤 Drop the previous week's Excel export above to enable continuity.")
+
+
 def main():
-    # AART Branding Header
-    col_logo, col_title = st.columns([1, 2])
-    with col_logo:
-        try:
-            st.image("Amazon now Logo.png", width=300)
-        except:
-            st.markdown("🚀")
-    with col_title:
-        st.title("AART - AI Assisted Rostering Tool")
-        st.caption("Multi-week roster planning with priority tuning + Network-wide optimization")
-    
-    st.markdown("---")
-    
+    # Apply global design system (CSS) once per rerun.
+    apply_global_styles()
+
+    # Determine header pill values (best-effort — don't block rendering).
+    _current_week_hdr = st.session_state.get('current_week')
+    _total_das_hdr = st.session_state.get('header_total_das')
+    _data_loaded_hdr = bool(st.session_state.get('header_data_loaded', False))
+    _crumb_store = st.session_state.get('selected_store')
+    _breadcrumb = ['Home', 'Store Roster']
+    if _crumb_store:
+        _breadcrumb.append(str(_crumb_store))
+
+    render_app_header(
+        title="AART — AI Assisted Rostering Tool",
+        subtitle="Multi-week roster planning with priority tuning and network-wide optimization",
+        week=_current_week_hdr,
+        total_das=_total_das_hdr,
+        data_loaded=_data_loaded_hdr,
+        breadcrumb=_breadcrumb,
+    )
+
     # Sidebar for file upload and settings
     with st.sidebar:
         st.header("📁 Data Input")
@@ -5058,6 +5270,9 @@ def main():
                         das_preview['DA_Count'] = 0
                 
                 total_das = int(das_preview['DA_Count'].sum())
+                # Expose live values to the header hero banner
+                st.session_state['header_total_das'] = total_das
+                st.session_state['header_data_loaded'] = True
                 stores_with_das = das_preview[das_preview['DA_Count'] > 0]['Store'].nunique()
                 dsps_with_das = len(das_preview[das_preview['DA_Count'] > 0])
                 st.success(f"📊 {selected_week}: {total_das} DAs across {stores_with_das} stores ({dsps_with_das} DSPs)")
@@ -5097,6 +5312,11 @@ def main():
                 st.success("✅ Data cache cleared! Reloading...")
                 st.rerun()
         
+        # =====================================================================
+        # WEEK CONTINUITY (Previous Week Roster Upload)
+        # =====================================================================
+        _render_week_continuity_sidebar(selected_week)
+
         st.header("⚙️ Engine Settings")
         
         # Engine Type Toggle (NEW)
@@ -7564,6 +7784,54 @@ def main():
 
             download_shifts = st.session_state.get(f'optimized_shifts_{selected_store}', shifts_df)
             
+            # =================================================================
+            # Week Continuity Report
+            # =================================================================
+            _prev_data = st.session_state.get('prev_week_data')
+            _wk_cont = st.session_state.get('week_continuity')
+            if _prev_data and _prev_data.get('total_overnight_das', 0) > 0:
+                st.markdown("---")
+                st.subheader("🔗 Week Continuity Report")
+                _prev_wk_lbl = _prev_data.get('week_detected') or 'Previous week'
+                _cur_wk_lbl = selected_week or 'Current'
+                st.caption(f"{_prev_wk_lbl} → {_cur_wk_lbl}")
+
+                _report_df = build_continuity_report_df(_prev_data, _wk_cont)
+                if not _report_df.empty:
+                    total_overnight = int(_report_df['Overnight_DAs'].sum())
+                    total_connected = int(_report_df['Connected'].sum())
+                    total_violations = int(_report_df['Violations'].sum())
+                    total_da_hours = sum(
+                        sum(s.get('coverage_hours', {}).values())
+                        for s in _prev_data.get('stores', {}).values()
+                    )
+                    _strategy = (_wk_cont or {}).get('strategy', 'full_continuity')
+
+                    render_kpi_grid([
+                        {'title': 'Overnight DAs', 'value': total_overnight,
+                         'color': 'blue', 'icon': '🌙',
+                         'caption': f"from {_prev_wk_lbl}"},
+                        {'title': 'Connected', 'value': total_connected,
+                         'color': 'green', 'icon': '🔗'},
+                        {'title': 'Violations', 'value': total_violations,
+                         'color': 'red' if total_violations else 'green',
+                         'icon': '⚠️' if total_violations else '✅'},
+                        {'title': 'DA-Hours Boost', 'value': int(total_da_hours),
+                         'color': 'orange', 'icon': '📈',
+                         'caption': 'Sunday coverage added'},
+                        {'title': 'Strategy', 'value': _strategy.replace('_', ' ').title(),
+                         'color': 'purple', 'icon': '🎯'},
+                    ])
+                    st.dataframe(_report_df, use_container_width=True, hide_index=True)
+
+                    if total_violations > 0:
+                        st.warning(
+                            f"⚠️ {total_violations} DA(s) require manual review — "
+                            "their minimum Sunday start is later than 22:00."
+                        )
+                    else:
+                        st.success("✅ All overnight DAs have valid Sunday rest windows.")
+
             st.markdown("---")
             st.subheader("📥 Download Options")
 
@@ -7870,6 +8138,39 @@ def main():
                         if carryover_rows:
                             carryover_df = pd.DataFrame(carryover_rows)
                             carryover_df.to_excel(writer, sheet_name='Sunday_Carryover', index=False)
+
+                    # Week_Continuity sheet — previous-week DA identity map
+                    _prev_data_dl = st.session_state.get('prev_week_data')
+                    _wk_cont_dl = st.session_state.get('week_continuity')
+                    if _prev_data_dl and _wk_cont_dl and _prev_data_dl.get('total_overnight_das', 0) > 0:
+                        # Build DA_ID -> Sunday shift start map from the current shifts
+                        _sun_starts = {}
+                        if download_shifts is not None and not download_shifts.empty:
+                            _sun_rows = download_shifts[
+                                (download_shifts['Day'] == 'Sun')
+                                & (~download_shifts['Is_Day_Off'])
+                                & (download_shifts['Shift_Start'].notna())
+                            ]
+                            for _, _r in _sun_rows.iterrows():
+                                _da_id = _r.get('DA_ID')
+                                if _da_id:
+                                    try:
+                                        _sun_starts[_da_id] = int(_r['Shift_Start'])
+                                    except (ValueError, TypeError):
+                                        pass
+                        _wc_df = build_week_continuity_sheet(
+                            _prev_data_dl,
+                            _wk_cont_dl.get('strategy', STRATEGY_FULL),
+                            sunday_shifts_by_da=_sun_starts,
+                            min_rest=int(params.get('min_rest', 12)),
+                        )
+                        if _wc_df is not None and not _wc_df.empty:
+                            # Filter to the selected store for single-store exports
+                            _wc_store = _wc_df[_wc_df['Store'] == selected_store]
+                            if not _wc_store.empty:
+                                _wc_store.to_excel(
+                                    writer, sheet_name='Week_Continuity', index=False
+                                )
                     
                     # Shift Starts Summary — distribution of shift start times
                     if download_shifts is not None:
