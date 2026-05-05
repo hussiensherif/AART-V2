@@ -7667,6 +7667,26 @@ def main():
         # POST-PROCESSING PASSES — Consistent Hours & DSP Mix (Features 1 & 2)
         # =========================================================================
         if shifts_df is not None and not shifts_df.empty:
+            # Enforce last_shift_start cap — clamp any DA starting after the cap
+            _last_cap = params.get('last_shift_start', 21)
+            _shift_h = params.get('shift_hours', 10)
+            _max_cont = params.get('max_continuous', 5)
+            _cap_fixed = 0
+            for _cap_idx, _cap_row in shifts_df.iterrows():
+                if _cap_row.get('Is_Day_Off') or pd.isna(_cap_row.get('Shift_Start')):
+                    continue
+                _cap_start = int(_cap_row['Shift_Start'])
+                if _cap_start > _last_cap:
+                    # Pull start back to the cap
+                    shifts_df.at[_cap_idx, 'Shift_Start'] = _last_cap
+                    shifts_df.at[_cap_idx, 'Shift_End'] = (_last_cap + _shift_h) % 24
+                    shifts_df.at[_cap_idx, 'Break_Hour'] = calculate_valid_break_hour(
+                        _last_cap, _shift_h, _max_cont
+                    )
+                    _cap_fixed += 1
+            if _cap_fixed > 0:
+                st.session_state[f'optimized_shifts_{selected_store}'] = shifts_df
+
             # Feature 2: Consistent daily shift hours
             if params.get('consistent_daily_hours', False):
                 shifts_df, _n_hour_fixes = enforce_consistent_shift_hours(shifts_df, params)
