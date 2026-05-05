@@ -824,8 +824,13 @@ DAYS_ORDER = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 def enforce_consistent_shift_hours(shifts_df, params):
     """Post-processing pass that ensures every DA works exactly *shift_hours*
-    on every working day.  Adjusts Shift_End, Break_Hour, and (if needed)
-    the next day's Shift_Start to maintain min_rest.
+    on every working day — no partial days, no variable lengths.
+
+    For each DA on each working day:
+    - Sets Shift_End = (Shift_Start + shift_hours) % 24
+    - Recalculates Break_Hour using calculate_valid_break_hour()
+    - If fixing Shift_End creates a rest violation with the next day,
+      adjusts the next day's Shift_Start forward to respect min_rest
 
     Returns ``(fixed_df, n_fixed)`` where *n_fixed* is the number of rows
     that were corrected.
@@ -844,9 +849,12 @@ def enforce_consistent_shift_hours(shifts_df, params):
         da_mask = df['DA_ID'] == da_id
         da_rows = df.loc[da_mask].copy()
 
-        # Sort by day order
-        day_order = {d: i for i, d in enumerate(DAYS_ORDER)}
-        da_rows = da_rows.sort_values('Day', key=lambda s: s.map(day_order))
+        # Sort by Day_Index for correct chronological order
+        if 'Day_Index' in da_rows.columns:
+            da_rows = da_rows.sort_values('Day_Index')
+        else:
+            day_order_map = {d: i for i, d in enumerate(DAYS_ORDER)}
+            da_rows = da_rows.sort_values('Day', key=lambda s: s.map(day_order_map))
         indices = da_rows.index.tolist()
 
         for pos, idx in enumerate(indices):
@@ -856,49 +864,56 @@ def enforce_consistent_shift_hours(shifts_df, params):
 
             start = int(row['Shift_Start'])
             expected_end = (start + shift_hours) % 24
-            current_end = int(row['Shift_End']) if pd.notna(row['Shift_End']) else expected_end
+            current_end = int(row['Shift_End']) if pd.notna(row['Shift_End']) else -1
 
+            # Always enforce: Shift_End must be exactly (start + shift_hours) % 24
             if current_end != expected_end:
                 df.at[idx, 'Shift_End'] = expected_end
-                # Recalculate break
-                df.at[idx, 'Break_Hour'] = calculate_valid_break_hour(
-                    start, shift_hours, max_continuous
-                )
                 n_fixed += 1
 
-                # Check if this creates a rest violation with the next working day
-                for next_pos in range(pos + 1, len(indices)):
-                    next_idx = indices[next_pos]
-                    next_row = df.loc[next_idx]
-                    if next_row['Is_Day_Off'] or pd.isna(next_row['Shift_Start']):
-                        continue
-                    next_start = int(next_row['Shift_Start'])
-                    # Calculate rest between end of this shift and start of next
-                    rest = (next_start - expected_end) % 24
-                    if rest == 0:
-                        rest = 24
-                    if rest < min_rest:
-                        # Push next day's start forward
-                        new_next_start = (expected_end + min_rest) % 24
-                        df.at[next_idx, 'Shift_Start'] = new_next_start
-                        new_next_end = (new_next_start + shift_hours) % 24
-                        df.at[next_idx, 'Shift_End'] = new_next_end
-                        df.at[next_idx, 'Break_Hour'] = calculate_valid_break_hour(
-                            new_next_start, shift_hours, max_continuous
-                        )
-                        n_fixed += 1
-                    break  # only check the immediate next working day
+            # Always recalculate break to be consistent with the shift window
+            df.at[idx, 'Break_Hour'] = calculate_valid_break_hour(
+                start, shift_hours, max_continuous
+            )
+
+            # Check rest violation with the next working day
+            for next_pos in range(pos + 1, len(indices)):
+                next_idx = indices[next_pos]
+                next_row = df.loc[next_idx]
+                if next_row['Is_Day_Off'] or pd.isna(next_row['Shift_Start']):
+                    continue
+                next_start = int(next_row['Shift_Start'])
+                # Rest = hours between this shift's end and next shift's start
+                rest = (next_start - expected_end) % 24
+                if rest == 0:
+                    rest = 24
+                if rest < min_rest:
+                    # Push next day's start forward to satisfy min_rest
+                    new_next_start = (expected_end + min_rest) % 24
+                    df.at[next_idx, 'Shift_Start'] = new_next_start
+                    new_next_end = (new_next_start + shift_hours) % 24
+                    df.at[next_idx, 'Shift_End'] = new_next_end
+                    df.at[next_idx, 'Break_Hour'] = calculate_valid_break_hour(
+                        new_next_start, shift_hours, max_continuous
+                    )
+                    n_fixed += 1
+                break  # only check the immediate next working day
 
     return df, n_fixed
 
 
 def enforce_dsp_mix_pass(shifts_df, demand_df, store, params):
-    """Post-processing pass that improves DSP diversity per slot.
+    """Post-processing pass that redistributes shift starts across DSPs so
+    that each active time slot is covered by a mix of DSP codes.
 
-    For each (day, slot) where all rostered DAs share the same DSP, attempt
-    to swap one DA's shift start by ±1 hour to bring a DA from a different
-    DSP into that slot.  Swaps are only applied when they don't violate
-    min_rest and keep the shift within operating hours.
+    Algorithm:
+    1. For each day, group working DAs by their shift start time.
+    2. For start times where ALL DAs belong to the same DSP, attempt to
+       move some DAs from that start to an adjacent start (±1h or ±2h)
+       where a different DSP already has coverage — creating overlap.
+    3. Alternatively, if a different DSP has DAs at a nearby start, swap
+       one DA's start to create interleaving.
+    4. All moves respect min_rest constraints.
 
     Returns ``(fixed_df, mix_score)`` where *mix_score* is the percentage
     of active slots that have 2+ DSPs after the pass.
@@ -911,83 +926,103 @@ def enforce_dsp_mix_pass(shifts_df, demand_df, store, params):
     max_continuous = params.get('max_continuous', 5)
 
     df = shifts_df.copy()
-    store_df = df[df['Store'] == store]
+    store_mask = df['Store'] == store
+    store_df = df[store_mask]
     if store_df.empty or 'DSP' not in store_df.columns:
         return df, 0.0
 
-    dsps_in_store = store_df['DSP'].nunique()
-    if dsps_in_store < 2:
-        # Only one DSP — nothing to mix
+    dsps_in_store = store_df['DSP'].unique().tolist()
+    if len(dsps_in_store) < 2:
         total_active, multi_dsp = _count_dsp_mix(df, store, shift_hours)
         score = (multi_dsp / total_active * 100) if total_active > 0 else 0.0
         return df, score
 
-    day_order = {d: i for i, d in enumerate(DAYS_ORDER)}
-
+    # Strategy: for each day, look at each shift start group.
+    # If a start has DAs from only one DSP, try to move one DA from a
+    # *different* DSP (at a different start) to this start, OR move one DA
+    # from this start to a neighboring start that has a different DSP.
     for day in DAYS_ORDER:
-        day_shifts = df[(df['Store'] == store) & (df['Day'] == day)]
-        for slot in range(24):
-            # Find DAs covering this slot
-            covering = []
-            for row_idx, row in day_shifts.iterrows():
-                if row['Is_Day_Off'] or pd.isna(row['Shift_Start']):
+        day_mask = store_mask & (df['Day'] == day) & (~df['Is_Day_Off']) & (df['Shift_Start'].notna())
+        day_indices = df.index[day_mask].tolist()
+        if not day_indices:
+            continue
+
+        # Build start→[(idx, dsp)] mapping
+        start_groups = {}
+        for idx in day_indices:
+            st_hr = int(df.at[idx, 'Shift_Start'])
+            dsp = df.at[idx, 'DSP']
+            start_groups.setdefault(st_hr, []).append((idx, dsp))
+
+        # For each start that has only one DSP, try to bring in a DA from another DSP
+        for target_start, members in list(start_groups.items()):
+            member_dsps = set(d for _, d in members)
+            if len(member_dsps) >= 2:
+                continue  # already mixed at this start
+
+            dominant_dsp = members[0][1]
+
+            # Strategy A: Find a DA from a different DSP at a nearby start (±1h, ±2h)
+            # and move it to target_start
+            moved = False
+            for delta in [1, -1, 2, -2]:
+                neighbor_start = (target_start + delta) % 24
+                if neighbor_start not in start_groups:
                     continue
-                start = int(row['Shift_Start'])
-                end = int(row['Shift_End'])
-                brk = int(row['Break_Hour']) if pd.notna(row.get('Break_Hour')) else -1
-                is_on = end < start  # overnight
-                if is_on:
-                    working = slot >= start or slot < end
-                else:
-                    working = start <= slot < end
-                if working and slot != brk:
-                    covering.append((row_idx, row['DSP']))
-
-            if len(covering) < 2:
-                continue  # 0 or 1 DA — can't mix
-
-            unique_dsps = set(d for _, d in covering)
-            if len(unique_dsps) >= 2:
-                continue  # already mixed
-
-            # All same DSP — try to swap one DA's start by ±1h to bring in a different DSP
-            # Look for DAs from a *different* DSP that are NOT covering this slot
-            # but could if their start shifted by ±1
-            other_dsp_das = day_shifts[
-                (day_shifts['DSP'] != covering[0][1])
-                & (~day_shifts['Is_Day_Off'])
-                & (day_shifts['Shift_Start'].notna())
-            ]
-            swapped = False
-            for cand_idx, cand in other_dsp_das.iterrows():
-                cand_start = int(cand['Shift_Start'])
-                for delta in [-1, 1]:
-                    new_start = (cand_start + delta) % 24
-                    new_end = (new_start + shift_hours) % 24
-                    # Would the new shift cover the target slot?
-                    is_on = new_end < new_start
-                    if is_on:
-                        covers = slot >= new_start or slot < new_end
-                    else:
-                        covers = new_start <= slot < new_end
-                    if not covers:
+                neighbor_members = start_groups[neighbor_start]
+                # Find a DA from a different DSP in the neighbor group
+                for n_idx, n_dsp in neighbor_members:
+                    if n_dsp == dominant_dsp:
                         continue
-                    # Check min_rest with previous and next day
-                    if not _rest_ok_after_swap(df, cand['DA_ID'], day, new_start, new_end, shift_hours, min_rest):
+                    # Can we move this DA to target_start?
+                    new_end = (target_start + shift_hours) % 24
+                    if not _rest_ok_after_swap(df, df.at[n_idx, 'DA_ID'], day, target_start, new_end, shift_hours, min_rest):
                         continue
-                    # Apply swap
-                    df.at[cand_idx, 'Shift_Start'] = new_start
-                    df.at[cand_idx, 'Shift_End'] = new_end
-                    df.at[cand_idx, 'Break_Hour'] = calculate_valid_break_hour(
-                        new_start, shift_hours, max_continuous
+                    # Apply move
+                    df.at[n_idx, 'Shift_Start'] = target_start
+                    df.at[n_idx, 'Shift_End'] = new_end
+                    df.at[n_idx, 'Break_Hour'] = calculate_valid_break_hour(
+                        target_start, shift_hours, max_continuous
                     )
-                    swapped = True
+                    # Update bookkeeping
+                    start_groups[neighbor_start] = [(i, d) for i, d in start_groups[neighbor_start] if i != n_idx]
+                    if not start_groups[neighbor_start]:
+                        del start_groups[neighbor_start]
+                    start_groups[target_start].append((n_idx, n_dsp))
+                    moved = True
                     break
-                if swapped:
+                if moved:
+                    break
+
+            if moved:
+                continue
+
+            # Strategy B: Move one DA from this start to a neighbor that has a different DSP
+            if len(members) >= 2:
+                for delta in [1, -1, 2, -2]:
+                    neighbor_start = (target_start + delta) % 24
+                    if neighbor_start in start_groups:
+                        neighbor_dsps = set(d for _, d in start_groups[neighbor_start])
+                        if dominant_dsp in neighbor_dsps:
+                            continue  # neighbor already has our DSP, won't help
+                    # Move one DA from target_start to neighbor_start
+                    candidate_idx = members[-1][0]  # pick last DA
+                    new_end = (neighbor_start + shift_hours) % 24
+                    if not _rest_ok_after_swap(df, df.at[candidate_idx, 'DA_ID'], day, neighbor_start, new_end, shift_hours, min_rest):
+                        continue
+                    df.at[candidate_idx, 'Shift_Start'] = neighbor_start
+                    df.at[candidate_idx, 'Shift_End'] = new_end
+                    df.at[candidate_idx, 'Break_Hour'] = calculate_valid_break_hour(
+                        neighbor_start, shift_hours, max_continuous
+                    )
+                    # Update bookkeeping
+                    start_groups[target_start] = [(i, d) for i, d in start_groups[target_start] if i != candidate_idx]
+                    start_groups.setdefault(neighbor_start, []).append((candidate_idx, dominant_dsp))
                     break
 
     total_active, multi_dsp = _count_dsp_mix(df, store, shift_hours)
     score = (multi_dsp / total_active * 100) if total_active > 0 else 0.0
+    df = df.sort_values(['Store', 'DA_ID', 'Day_Index']).reset_index(drop=True)
     return df, score
 
 
@@ -5992,6 +6027,8 @@ def main():
                 key="dd_max_shifts",
                 help="Limit the number of unique shift start times. 0 = engine picks as many as needed. Set to 6-10 for operational simplicity."
             )
+            st.session_state['dd_max_shifts_val'] = max_shifts
+            st.caption(f"Engine will receive max_shifts={max_shifts}")
             if max_shifts > 0:
                 st.caption(f"Engine will auto-select the best {max_shifts} shift start times from demand")
 
@@ -7105,7 +7142,7 @@ def main():
                             'min_rest': _resolved.get('min_rest', 14),
                             'working_days': _resolved.get('working_days', 6),
                             'fixed_start_optimizer': _resolved.get('fixed_start_optimizer', 'strict'),
-                            'max_shifts': _resolved.get('max_shifts', 8)
+                            'max_shifts': _resolved.get('max_shifts', 0)
                         })
                         inject_operating_window_params(engine_params, selected_store, _sc)
 
@@ -7353,6 +7390,8 @@ def main():
             # Feature 2: Consistent daily shift hours
             if params.get('consistent_daily_hours', False):
                 shifts_df, _n_hour_fixes = enforce_consistent_shift_hours(shifts_df, params)
+                # Always save back — ensures the export uses the enforced version
+                st.session_state[f'optimized_shifts_{selected_store}'] = shifts_df
                 if _n_hour_fixes > 0:
                     # Regenerate roster_df from the corrected shifts
                     store_demand = demand_df[demand_df['Store'] == selected_store]
@@ -7380,6 +7419,8 @@ def main():
             # Feature 1: DSP mix enforcement
             if params.get('enforce_dsp_mix', False):
                 shifts_df, _dsp_score = enforce_dsp_mix_pass(shifts_df, demand_df, selected_store, params)
+                # Save post-pass shifts back so the export uses the corrected version
+                st.session_state[f'optimized_shifts_{selected_store}'] = shifts_df
                 if _dsp_score > 0:
                     # Regenerate roster_df from the adjusted shifts
                     store_demand = demand_df[demand_df['Store'] == selected_store]
@@ -8249,8 +8290,9 @@ def main():
             st.subheader("📥 Download Options")
 
             # Initialize DSP Mix defaults so they are always defined regardless
-            # of which expander the user opens.
-            enable_dsp_mix = False
+            # of which expander the user opens.  Read from session state so the
+            # value matches the checkbox widget (whose key persists across reruns).
+            enable_dsp_mix = st.session_state.get('enable_dsp_mix', False)
             min_dsps_per_slot = 2
 
             # LM Cap Generation
