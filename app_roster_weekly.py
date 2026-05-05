@@ -847,14 +847,16 @@ DAYS_ORDER = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 
 def enforce_consistent_shift_hours(shifts_df, params):
-    """Post-processing pass that ensures every DA works exactly *shift_hours*
-    on every working day — no partial days, no variable lengths.
+    """Post-processing pass: every DA works exactly *shift_hours* on every
+    working day, with NO overnight shifts. All shifts start and end within
+    the same calendar day.
 
-    Each working DA-day gets:
-    - Shift_End = (Shift_Start + shift_hours) % 24  (overnight wraps allowed)
-    - Break_Hour recalculated for the full shift window
-    - If the corrected shift violates min_rest with the next day, the next
-      day's start is pushed forward
+    Rules:
+    1. Every working day = exactly shift_hours duration
+    2. NO shift crosses midnight — if a start would make the shift overnight,
+       pull it back to (24 - shift_hours) so it ends at midnight
+    3. Proper rest gap between consecutive working days
+    4. Off days show clean "OFF" with no carryover bleed
 
     Returns ``(fixed_df, n_fixed)`` where *n_fixed* is the number of rows
     that were corrected.
@@ -865,6 +867,7 @@ def enforce_consistent_shift_hours(shifts_df, params):
     shift_hours = params.get('shift_hours', 10)
     max_continuous = params.get('max_continuous', 5)
     min_rest = params.get('min_rest', 14)
+    max_same_day_start = 24 - shift_hours  # latest start that keeps shift within the day
 
     df = shifts_df.copy()
     n_fixed = 0
@@ -873,7 +876,6 @@ def enforce_consistent_shift_hours(shifts_df, params):
         da_mask = df['DA_ID'] == da_id
         da_rows = df.loc[da_mask].copy()
 
-        # Sort by Day_Index for correct chronological order
         if 'Day_Index' in da_rows.columns:
             da_rows = da_rows.sort_values('Day_Index')
         else:
@@ -881,80 +883,50 @@ def enforce_consistent_shift_hours(shifts_df, params):
             da_rows = da_rows.sort_values('Day', key=lambda s: s.map(day_order_map))
         indices = da_rows.index.tolist()
 
+        prev_end = None
+
         for pos, idx in enumerate(indices):
             row = df.loc[idx]
             if row['Is_Day_Off'] or pd.isna(row['Shift_Start']):
+                prev_end = None
                 continue
 
             start = int(row['Shift_Start'])
-            expected_end = (start + shift_hours) % 24
-            current_end = int(row['Shift_End']) if pd.notna(row['Shift_End']) else -1
 
-            # Enforce exact shift_hours duration (overnight wraps are fine)
-            if current_end != expected_end:
-                df.at[idx, 'Shift_End'] = expected_end
+            # Clamp start so shift doesn't go overnight
+            if start > max_same_day_start:
+                start = max_same_day_start
+                df.at[idx, 'Shift_Start'] = start
                 n_fixed += 1
 
-            # Always recalculate break for the full shift window
+            # Enforce rest with previous day
+            if prev_end is not None:
+                # prev_end is always <= 24 (same-day), so rest = (24 - prev_end) + start
+                rest = (24 - prev_end) + start
+                if prev_end == 0:
+                    rest = start  # prev ended at midnight
+                if rest < min_rest:
+                    # Push start forward
+                    start = min_rest - (24 - prev_end) if prev_end > 0 else min_rest
+                    if start < 0:
+                        start = 0
+                    # Re-clamp
+                    if start > max_same_day_start:
+                        start = max_same_day_start
+                    df.at[idx, 'Shift_Start'] = start
+                    n_fixed += 1
+
+            # Set end = start + shift_hours (guaranteed <= 24 since start <= max_same_day_start)
+            end = start + shift_hours
+            if end == 24:
+                end = 0  # midnight notation
+            df.at[idx, 'Shift_End'] = end
             df.at[idx, 'Break_Hour'] = calculate_valid_break_hour(
                 start, shift_hours, max_continuous
             )
 
-            # Check rest violation with the next working day
-            for next_pos in range(pos + 1, len(indices)):
-                next_idx = indices[next_pos]
-                next_row = df.loc[next_idx]
-                if next_row['Is_Day_Off'] or pd.isna(next_row['Shift_Start']):
-                    continue
-                next_start = int(next_row['Shift_Start'])
-
-                # Calculate rest: hours between this shift's end and next shift's start
-                # For overnight shifts (end < start), the shift ends on the NEXT calendar day
-                is_overnight = expected_end < start or (expected_end == 0 and start > 0)
-                if is_overnight:
-                    # Shift ends on the next day at expected_end
-                    # Next shift starts on the day after that
-                    # Rest = (24 - expected_end) + next_start ... but they're on consecutive days
-                    # Actually: this shift's day + overnight end = next calendar day at expected_end
-                    # Next working day starts at next_start
-                    # If next working day is the immediate next day: rest = next_start - expected_end
-                    rest = (next_start - expected_end) % 24
-                    if rest == 0:
-                        rest = 24
-                else:
-                    # Same-day shift: ends today at expected_end, next day starts at next_start
-                    rest = (24 - expected_end) + next_start
-                    if expected_end == 0:
-                        rest = next_start
-
-                if rest < min_rest:
-                    # Push next day's start forward
-                    if is_overnight:
-                        new_next_start = (expected_end + min_rest) % 24
-                    else:
-                        new_next_start = (expected_end + min_rest) % 24
-                    new_next_end = (new_next_start + shift_hours) % 24
-                    df.at[next_idx, 'Shift_Start'] = new_next_start
-                    df.at[next_idx, 'Shift_End'] = new_next_end
-                    df.at[next_idx, 'Break_Hour'] = calculate_valid_break_hour(
-                        new_next_start, shift_hours, max_continuous
-                    )
-                    n_fixed += 1
-                break  # only check the immediate next working day
-
-    # Final validation sweep
-    unfixable = 0
-    for idx, row in df.iterrows():
-        if row['Is_Day_Off'] or pd.isna(row.get('Shift_Start')):
-            continue
-        s = int(row['Shift_Start'])
-        e = int(row['Shift_End']) if pd.notna(row.get('Shift_End')) else -1
-        expected = (s + shift_hours) % 24
-        if e != expected:
-            unfixable += 1
-
-    if unfixable > 0:
-        n_fixed += unfixable
+            # Track for next day's rest calculation
+            prev_end = end if end != 0 else 24  # use 24 internally for math
 
     return df, n_fixed
 
@@ -7694,80 +7666,82 @@ def main():
                 st.session_state[f'optimized_shifts_{selected_store}'] = shifts_df
                 if _n_hour_fixes > 0:
                     # Regenerate roster_df from the corrected shifts
+                    # Use skip_sunday_overnight=True to prevent carryover display
                     store_demand = demand_df[demand_df['Store'] == selected_store]
                     _ce = st.session_state.get('engine_type', 'demand_driven')
-                    # Use full params for regeneration (includes carryover settings)
+                    # Use full params for regeneration — disable overnight carryover
+                    # since consistent hours eliminates all overnight shifts
                     if _ce == 'fixed':
                         _ep = fixed_get_params({k: params.get(k) for k in ['shift_hours','break_hours','max_continuous','min_rest','working_days']})
                         roster_df = fixed_generate_hourly_roster(shifts_df, store_demand, _ep)
                     elif _ce == 'demand_driven':
                         _ep = v14_get_params({
-                            'night_shift_enabled': params.get('night_shift', True),
+                            'night_shift_enabled': False,
                             'shift_hours': params.get('shift_hours', 10),
                             'break_hours': params.get('break_hours', 1),
                             'max_continuous': params.get('max_continuous', 5),
                             'min_rest': params.get('min_rest', 14),
                             'working_days': params.get('working_days', 6),
-                            'skip_sunday_overnight': params.get('skip_sunday_overnight', False),
-                            'carryover_mode': params.get('carryover_mode', 'auto'),
-                            'sunday_carryover_das': params.get('sunday_carryover_das', 0),
-                            'carryover_excel_data': params.get('carryover_excel_data', []),
+                            'skip_sunday_overnight': True,
+                            'carryover_mode': 'skip',
+                            'sunday_carryover_das': 0,
+                            'carryover_excel_data': [],
                         })
                         roster_df = v14_generate_hourly_roster(shifts_df, store_demand, _ep)
                     elif _ce == 'demand_driven_ultimate':
                         _ep = v14u_get_params({
-                            'night_shift_enabled': params.get('night_shift', True),
+                            'night_shift_enabled': False,
                             'shift_hours': params.get('shift_hours', 10),
                             'break_hours': params.get('break_hours', 1),
                             'max_continuous': params.get('max_continuous', 5),
                             'min_rest': params.get('min_rest', 14),
                             'working_days': params.get('working_days', 6),
-                            'skip_sunday_overnight': params.get('skip_sunday_overnight', False),
-                            'carryover_mode': params.get('carryover_mode', 'auto'),
-                            'sunday_carryover_das': params.get('sunday_carryover_das', 0),
-                            'carryover_excel_data': params.get('carryover_excel_data', []),
+                            'skip_sunday_overnight': True,
+                            'carryover_mode': 'skip',
+                            'sunday_carryover_das': 0,
+                            'carryover_excel_data': [],
                         })
                         roster_df = v14u_generate_hourly_roster(shifts_df, store_demand, _ep)
                     elif _ce == 'tunable':
                         _ep = v15_get_params({
-                            'night_shift_enabled': params.get('night_shift', True),
+                            'night_shift_enabled': False,
                             'shift_hours': params.get('shift_hours', 10),
                             'break_hours': params.get('break_hours', 1),
                             'max_continuous': params.get('max_continuous', 5),
                             'min_rest': params.get('min_rest', 14),
                             'working_days': params.get('working_days', 6),
-                            'skip_sunday_overnight': params.get('skip_sunday_overnight', False),
-                            'carryover_mode': params.get('carryover_mode', 'auto'),
-                            'sunday_carryover_das': params.get('sunday_carryover_das', 0),
-                            'carryover_excel_data': params.get('carryover_excel_data', []),
+                            'skip_sunday_overnight': True,
+                            'carryover_mode': 'skip',
+                            'sunday_carryover_das': 0,
+                            'carryover_excel_data': [],
                         })
                         roster_df = v15_generate_hourly_roster(shifts_df, store_demand, _ep)
                     elif _ce == 'proportional':
                         _ep = v13_get_params({
-                            'night_shift_enabled': params.get('night_shift', True),
+                            'night_shift_enabled': False,
                             'shift_hours': params.get('shift_hours', 10),
                             'break_hours': params.get('break_hours', 1),
                             'max_continuous': params.get('max_continuous', 5),
                             'min_rest': params.get('min_rest', 14),
                             'working_days': params.get('working_days', 6),
-                            'skip_sunday_overnight': params.get('skip_sunday_overnight', False),
-                            'carryover_mode': params.get('carryover_mode', 'auto'),
-                            'sunday_carryover_das': params.get('sunday_carryover_das', 0),
-                            'carryover_excel_data': params.get('carryover_excel_data', []),
+                            'skip_sunday_overnight': True,
+                            'carryover_mode': 'skip',
+                            'sunday_carryover_das': 0,
+                            'carryover_excel_data': [],
                         })
                         roster_df = v13_generate_hourly_roster(shifts_df, store_demand, _ep)
                     else:
                         _ep = engine_get_params({
-                            'night_shift_enabled': params.get('night_shift', True),
+                            'night_shift_enabled': False,
                             'shift_hours': params.get('shift_hours', 10),
                             'break_hours': params.get('break_hours', 1),
                             'max_continuous': params.get('max_continuous', 5),
                             'min_rest': params.get('min_rest', 14),
                             'working_days': params.get('working_days', 6),
-                            'skip_sunday_overnight': params.get('skip_sunday_overnight', False),
-                            'carryover_mode': params.get('carryover_mode', 'auto'),
-                            'sunday_carryover_das': params.get('sunday_carryover_das', 0),
-                            'carryover_excel_data': params.get('carryover_excel_data', []),
+                            'skip_sunday_overnight': True,
+                            'carryover_mode': 'skip',
+                            'sunday_carryover_das': 0,
+                            'carryover_excel_data': [],
                         })
                         roster_df = engine_generate_hourly_roster(shifts_df, store_demand, _ep)
                 st.session_state[f'_consistent_hours_fixes_{selected_store}'] = _n_hour_fixes
