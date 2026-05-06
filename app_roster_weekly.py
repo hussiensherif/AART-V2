@@ -1185,15 +1185,11 @@ def interleave_da_columns(shifts_df, roster_df):
 
 
 def _fix_zero_coverage_slots(shifts_df, roster_df, demand_df, store, params):
-    """Attempt to fix zero-coverage slots by shifting DAs from over-covered
-    hours into uncovered hours.
+    """Fast gap optimizer — moves DAs from over-covered slots to under-covered slots.
 
-    Strategy:
-    1. Identify all (day, slot) with demand > 0 and rostered == 0
-    2. For each zero-coverage slot, find DAs working on that day whose shift
-       could be moved ±1-3 hours to cover the gap
-    3. Only move a DA if the source slot has excess coverage (rostered > required)
-    4. Respect min_rest constraints
+    Only works when there are slots with EXCESS coverage that can donate a DA
+    to slots with zero or under coverage. If there's no excess anywhere,
+    returns None (can't fix without more DAs).
 
     Returns the modified shifts_df, or None if no fixes could be applied.
     """
@@ -1205,87 +1201,99 @@ def _fix_zero_coverage_slots(shifts_df, roster_df, demand_df, store, params):
     shift_hours = params.get('shift_hours', 10)
     min_rest = params.get('min_rest', 14)
     max_continuous = params.get('max_continuous', 5)
-    last_start_cap = params.get('last_shift_start', 21)
+    consistent_hours = params.get('consistent_daily_hours', False)
+    max_start = (24 - shift_hours) if consistent_hours else params.get('last_shift_start', 21)
 
     df = shifts_df.copy()
     fixes_applied = 0
 
-    # Find zero-coverage slots
-    zero_slots = roster_df[(roster_df['Required'] > 0) & (roster_df['Rostered'] == 0)]
-    if zero_slots.empty:
-        return None
+    # For each day, find slots with excess and slots with gap
+    for day in DAYS_ORDER:
+        day_roster = roster_df[roster_df['Day'] == day].copy()
+        if day_roster.empty:
+            continue
 
-    for _, zrow in zero_slots.iterrows():
-        day = zrow['Day']
-        slot = int(zrow['Slot'])
+        # Slots that need help (zero coverage or under-covered)
+        gap_slots = day_roster[
+            (day_roster['Required'] > 0) & (day_roster['Rostered'] == 0)
+        ]['Slot'].tolist()
+        if not gap_slots:
+            continue
 
-        # Find DAs working on this day
-        day_shifts = df[(df['Store'] == store) & (df['Day'] == day) & (~df['Is_Day_Off']) & (df['Shift_Start'].notna())]
+        # Slots with excess (can donate)
+        excess_slots = day_roster[
+            day_roster['Rostered'] > day_roster['Required']
+        ].sort_values('Diff', ascending=False)  # most excess first
+
+        if excess_slots.empty:
+            continue  # no excess to redistribute
+
+        # Find DAs in excess slots that could be moved
+        day_shifts = df[
+            (df['Store'] == store) & (df['Day'] == day)
+            & (~df['Is_Day_Off']) & (df['Shift_Start'].notna())
+        ]
         if day_shifts.empty:
             continue
 
-        # Find a DA whose shift could be moved to cover this slot
-        best_candidate = None
-        best_delta = 999
+        for target_slot in sorted(gap_slots):
+            # Find a DA currently starting in an excess zone that could shift to cover target
+            # Best new_start: target_slot should be within [new_start, new_start + shift_hours)
+            # So new_start can be from max(0, target_slot - shift_hours + 1) to target_slot
+            moved = False
+            for idx, da_row in day_shifts.iterrows():
+                if moved:
+                    break
+                curr_start = int(da_row['Shift_Start'])
+                curr_end = curr_start + shift_hours
 
-        for idx, da_row in day_shifts.iterrows():
-            start = int(da_row['Shift_Start'])
-            end = int(da_row['Shift_End']) if pd.notna(da_row['Shift_End']) else (start + shift_hours) % 24
-
-            # Check if moving this DA's start would cover the zero slot
-            for delta in [-1, 1, -2, 2, -3, 3]:
-                new_start = start + delta
-                if new_start < 0 or new_start > last_start_cap:
-                    continue
-                new_end = new_start + shift_hours
-                if new_end > 24:
-                    continue  # avoid overnight
-
-                # Would the new shift cover the target slot?
-                if not (new_start <= slot < new_end):
-                    continue
-
-                # Check that the source slot (where DA currently covers) has excess
-                # Find a slot that the DA currently covers but won't after the move
-                lost_slots = []
-                for h in range(start, start + shift_hours):
-                    if h >= 24:
+                # Is this DA in an excess slot?
+                da_covers_excess = False
+                for _, ex_row in excess_slots.iterrows():
+                    ex_slot = int(ex_row['Slot'])
+                    if curr_start <= ex_slot < min(curr_end, 24):
+                        da_covers_excess = True
                         break
-                    if not (new_start <= h < new_end):
-                        lost_slots.append(h)
-
-                # Check if all lost slots have excess coverage
-                can_move = True
-                for lost_h in lost_slots:
-                    lost_row = roster_df[(roster_df['Day'] == day) & (roster_df['Slot'] == lost_h)]
-                    if not lost_row.empty:
-                        if lost_row.iloc[0]['Rostered'] <= lost_row.iloc[0]['Required']:
-                            can_move = False
-                            break
-
-                if not can_move:
+                if not da_covers_excess:
                     continue
 
-                # Check min_rest
-                if not _rest_ok_after_swap(df, da_row['DA_ID'], day, new_start, new_end % 24 if new_end < 24 else 0, shift_hours, min_rest):
-                    continue
+                # Try the minimal move to cover target_slot
+                # New start should place target_slot in the shift window
+                best_new_start = max(0, target_slot - shift_hours + 1)
+                # Pick the start closest to current
+                candidates = list(range(
+                    max(0, target_slot - shift_hours + 1),
+                    min(target_slot + 1, max_start + 1)
+                ))
+                candidates.sort(key=lambda s: abs(s - curr_start))
 
-                if abs(delta) < best_delta:
-                    best_delta = abs(delta)
-                    best_candidate = (idx, new_start)
+                for new_start in candidates:
+                    if new_start == curr_start:
+                        continue
+                    if new_start > max_start:
+                        continue
+                    new_end = new_start + shift_hours
+                    if new_end > 24 and consistent_hours:
+                        continue
 
-        # Apply the best candidate
-        if best_candidate is not None:
-            c_idx, c_new_start = best_candidate
-            c_new_end = c_new_start + shift_hours
-            if c_new_end >= 24:
-                c_new_end = 0
-            df.at[c_idx, 'Shift_Start'] = c_new_start
-            df.at[c_idx, 'Shift_End'] = c_new_end
-            df.at[c_idx, 'Break_Hour'] = calculate_valid_break_hour(
-                c_new_start, shift_hours, max_continuous
-            )
-            fixes_applied += 1
+                    # Verify target is covered
+                    if not (new_start <= target_slot < new_end):
+                        continue
+
+                    # Check rest
+                    new_end_val = new_end if new_end < 24 else 0
+                    if not _rest_ok_after_swap(df, da_row['DA_ID'], day, new_start, new_end_val, shift_hours, min_rest):
+                        continue
+
+                    # Apply
+                    df.at[idx, 'Shift_Start'] = new_start
+                    df.at[idx, 'Shift_End'] = new_end_val
+                    df.at[idx, 'Break_Hour'] = calculate_valid_break_hour(
+                        new_start, shift_hours, max_continuous
+                    )
+                    fixes_applied += 1
+                    moved = True
+                    break
 
     if fixes_applied > 0:
         df = df.sort_values(['Store', 'DA_ID', 'Day_Index']).reset_index(drop=True)
@@ -5797,30 +5805,10 @@ def main():
 
         st.header("⚙️ Engine Settings")
         
-        # --- Feature toggles (above engine type) ---
-        enforce_dsp_mix = st.checkbox(
-            "🔀 Enforce DSP Mix per Slot",
-            value=st.session_state.get('enforce_dsp_mix', False),
-            key="cb_enforce_dsp_mix",
-            help="Distribute DAs so no time slot is covered exclusively by one DSP code"
-        )
-        st.session_state['enforce_dsp_mix'] = enforce_dsp_mix
-
-        consistent_daily_hours = st.checkbox(
-            "⏱️ Consistent Daily Hours (same shift length every day)",
-            value=st.session_state.get('consistent_daily_hours', False),
-            key="cb_consistent_daily_hours",
-            help="Every DA works exactly the configured shift hours on every working day — no partial days"
-        )
-        st.session_state['consistent_daily_hours'] = consistent_daily_hours
-
-        enable_flex_shifts = st.checkbox(
-            "⚡ Enable Flex (Part-Time) DAs",
-            value=st.session_state.get('enable_flex_shifts', True),
-            key="cb_enable_flex_shifts",
-            help="When enabled, part-time Flex DAs fill coverage gaps after full-time roster generation. Disable to use full-time DAs only."
-        )
-        st.session_state['enable_flex_shifts'] = enable_flex_shifts
+        # Feature defaults (hardcoded — UI toggles removed)
+        enforce_dsp_mix = False
+        consistent_daily_hours = False
+        enable_flex_shifts = True
 
         # Engine Type Toggle (NEW)
         engine_type = st.radio(
@@ -7879,6 +7867,26 @@ def main():
             with adv_col5:
                 coverage_pct = (total_rostered / total_required * 100) if total_required > 0 else 0
                 st.metric("📊 Coverage", f"{coverage_pct:.1f}%")
+
+            # Fix Gap button — always visible when there's a gap
+            if total_gap < 0 and shifts_df is not None and not shifts_df.empty:
+                _gap_abs = int(abs(total_gap))
+                _zero_cov_count = len(roster_df[(roster_df['Required'] > 0) & (roster_df['Rostered'] == 0)]) if roster_df is not None else 0
+                _btn_label = f"🛠️ Optimize Coverage (Gap: {_gap_abs}"
+                if _zero_cov_count > 0:
+                    _btn_label += f", {_zero_cov_count} zero slots"
+                _btn_label += ")"
+                if st.button(_btn_label, key="fix_gap_main_btn", type="primary"):
+                    with st.spinner("Optimizing coverage — redistributing shifts..."):
+                        _fixed = _fix_zero_coverage_slots(
+                            shifts_df, roster_df, demand_df, selected_store, params
+                        )
+                        if _fixed is not None:
+                            st.session_state[f'optimized_shifts_{selected_store}'] = _fixed
+                            st.success("✅ Coverage optimized! Regenerating...")
+                            st.rerun()
+                        else:
+                            st.warning("⚠️ Could not reduce gap further — all DAs are optimally placed or no excess slots to redistribute from.")
 
             # Flex DA impact metrics (only shown when store has Flex DAs assigned)
             if store_flex_count > 0 and flex_roster_df is not None and not flex_roster_df.empty:
