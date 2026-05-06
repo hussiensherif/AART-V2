@@ -9355,6 +9355,20 @@ def main():
                                 if store_shifts is None or store_shifts.empty:
                                     continue
                                 
+                                # Enforce last_shift_start cap on loaded shifts
+                                _last_cap = params.get('last_shift_start', 21)
+                                _shift_h = params.get('shift_hours', 10)
+                                _max_cont = params.get('max_continuous', 5)
+                                for _ci, _cr in store_shifts.iterrows():
+                                    if _cr.get('Is_Day_Off') or pd.isna(_cr.get('Shift_Start')):
+                                        continue
+                                    if int(_cr['Shift_Start']) > _last_cap:
+                                        store_shifts.at[_ci, 'Shift_Start'] = _last_cap
+                                        store_shifts.at[_ci, 'Shift_End'] = (_last_cap + _shift_h) % 24
+                                        store_shifts.at[_ci, 'Break_Hour'] = calculate_valid_break_hour(
+                                            _last_cap, _shift_h, _max_cont
+                                        )
+
                                 # Generate roster
                                 if current_engine == 'fixed':
                                     store_roster = fixed_generate_hourly_roster(store_shifts, store_demand, engine_params)
